@@ -42,7 +42,9 @@ internal static class AceConnectionFactory
             DataSource = options.MdbPath
         };
         builder["Persist Security Info"] = false;
-        builder["Mode"] = "Share Deny None";
+        // ConnectModeEnum.adModeShareDenyNone. The English name is not a legal
+        // value: Jet splits on the spaces and looks up an ISAM named "Deny".
+        builder["Mode"] = 16;
         // Kilobytes. Jet tops out at 4096; a larger cache keeps a big sequential read off the disk.
         builder["Jet OLEDB:Max Buffer Size"] = 4096;
 
