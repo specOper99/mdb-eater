@@ -25,13 +25,14 @@ public sealed partial class MainWindow : Window
     private int _step;
     private bool _busy;
     private bool _suppressSelectionEvents;
+    private bool _uiReady;
     private CancellationTokenSource? _exportCts;
 
     public MainWindow()
     {
+        _settings = _settingsStore.Load();
         InitializeComponent();
         ExtendsContentIntoTitleBar = false;
-        _settings = _settingsStore.Load();
         MdbPathBox.Text = _settings.LastMdbPath ?? string.Empty;
         MdwPathBox.Text = _settings.LastWorkgroupPath ?? string.Empty;
         WorkgroupUserBox.Text = _settings.LastWorkgroupUser ?? string.Empty;
@@ -42,6 +43,7 @@ public sealed partial class MainWindow : Window
         ObjectList.ItemsSource = _objects;
         Closed += (_, _) => CloseSession();
         ShowStep(0);
+        _uiReady = true;
     }
 
     private async void BrowseMdb_Click(object sender, RoutedEventArgs e)
@@ -82,6 +84,11 @@ public sealed partial class MainWindow : Window
 
     private void ConflictButtons_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (!_uiReady)
+        {
+            return;
+        }
+
         _settings.ConflictMode = CurrentConflict();
     }
 
