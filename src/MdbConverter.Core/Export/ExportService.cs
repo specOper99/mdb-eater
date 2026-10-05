@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using MdbConverter.Core.Access;
@@ -10,6 +11,8 @@ namespace MdbConverter.Core.Export;
 
 public sealed class ExportService
 {
+    private const int MaxInsertBytes = 4 * 1024 * 1024;
+    private const int ProgressEveryRows = 5000;
     public ExportResult Run(
         ExportRequest request,
         IMdbSession session,
@@ -47,7 +50,11 @@ public sealed class ExportService
         PostgresSqlWriter? sql = null;
         if (request.WritePostgresSql)
         {
-            sqlFile = new StreamWriter(Path.Combine(request.OutputDirectory, "postgres.sql"), false, new UTF8Encoding(false));
+            sqlFile = new StreamWriter(
+                Path.Combine(request.OutputDirectory, "postgres.sql"),
+                false,
+                new UTF8Encoding(false),
+                1 << 20);
             sql = new PostgresSqlWriter(sqlFile, request.ConflictMode);
             sql.WriteHeader();
         }
@@ -77,41 +84,51 @@ public sealed class ExportService
                     }
                     else
                     {
-                        StreamWriter? jsonlFile = null;
-                        var batch = new List<IReadOnlyDictionary<string, object?>>(sql?.BatchSize ?? 50);
+                        FileStream? jsonlStream = null;
+                        MemoryStream? jsonBuffer = null;
+                        Utf8JsonWriter? jsonWriter = null;
+                        var batch = new List<IReadOnlyDictionary<string, object?>>(sql?.BatchSize ?? 1);
+                        var batchBytes = 0;
                         try
                         {
                             if (request.WriteJson)
                             {
                                 var jsonlPath = FileNames.Unique(dataDir, FileNames.ForObject(table.Name), ".jsonl", jsonlNames);
                                 jsonlRelative = Path.GetRelativePath(request.OutputDirectory, jsonlPath).Replace('\\', '/');
-                                jsonlFile = new StreamWriter(jsonlPath, false, new UTF8Encoding(false));
+                                jsonlStream = new FileStream(jsonlPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+                                jsonBuffer = new MemoryStream(16 * 1024);
+                                jsonWriter = new Utf8JsonWriter(jsonBuffer, JsonlWriter.WriterOptions);
                             }
 
+                            Log(progress, LogLevel.Info, table.Name, "Reading rows.", transient: true);
                             foreach (var row in session.ReadRows(table.Name))
                             {
                                 cancellationToken.ThrowIfCancellationRequested();
                                 rowCount++;
-
-                                if (jsonlFile is not null)
+                                if (rowCount % ProgressEveryRows == 0)
                                 {
-                                    using var stream = new MemoryStream();
-                                    using (var rowWriter = new Utf8JsonWriter(stream, JsonlWriter.WriterOptions))
-                                    {
-                                        JsonlWriter.WriteRow(rowWriter, table.Columns, row);
-                                        rowWriter.Flush();
-                                    }
+                                    Log(progress, LogLevel.Info, table.Name, rowCount.Value.ToString("N0", CultureInfo.InvariantCulture) + " rows", transient: true);
+                                }
 
-                                    jsonlFile.WriteLine(Encoding.UTF8.GetString(stream.ToArray()));
+                                if (jsonWriter is not null && jsonBuffer is not null && jsonlStream is not null)
+                                {
+                                    jsonBuffer.SetLength(0);
+                                    jsonWriter.Reset(jsonBuffer);
+                                    JsonlWriter.WriteRow(jsonWriter, table.Columns, row);
+                                    jsonWriter.Flush();
+                                    jsonlStream.Write(jsonBuffer.GetBuffer(), 0, (int)jsonBuffer.Length);
+                                    jsonlStream.WriteByte((byte)'\n');
                                 }
 
                                 if (sql is not null)
                                 {
                                     batch.Add(row);
-                                    if (batch.Count >= sql.BatchSize)
+                                    batchBytes += EstimateRow(row);
+                                    if (batch.Count >= sql.BatchSize || batchBytes >= MaxInsertBytes)
                                     {
                                         sql.WriteInsertBatch(table, batch);
                                         batch.Clear();
+                                        batchBytes = 0;
                                     }
                                 }
                             }
@@ -123,7 +140,9 @@ public sealed class ExportService
                         }
                         finally
                         {
-                            jsonlFile?.Dispose();
+                            jsonWriter?.Dispose();
+                            jsonBuffer?.Dispose();
+                            jsonlStream?.Dispose();
                         }
 
                         Log(progress, LogLevel.Info, table.Name, $"Wrote {(rowCount ?? 0).ToString(System.Globalization.CultureInfo.InvariantCulture)} rows.");
@@ -148,20 +167,27 @@ public sealed class ExportService
             var queries = request.Catalog.Queries
                 .Where(q => request.Selection.QueryNames.Contains(q.Name))
                 .ToList();
+            IReadOnlyDictionary<string, string?>? querySql = null;
 
             foreach (var query in queries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    if (string.IsNullOrWhiteSpace(query.Sql))
+                    var sqlText = query.Sql;
+                    if (string.IsNullOrWhiteSpace(sqlText))
                     {
-                        failed++;
-                        Log(progress, LogLevel.Error, query.Name, "Query SQL was not available.");
-                        continue;
+                        querySql ??= session.ReadQuerySql();
+                        if (!querySql.TryGetValue(query.Name, out sqlText) || string.IsNullOrWhiteSpace(sqlText))
+                        {
+                            failed++;
+                            Log(progress, LogLevel.Error, query.Name, session.AccessUnavailableReason ?? "Query SQL was not available.");
+                            continue;
+                        }
                     }
 
-                    exportedQueries.Add(query);
+                    var resolved = new QuerySchema { Name = query.Name, Sql = sqlText };
+                    exportedQueries.Add(resolved);
                     written++;
                     Log(progress, LogLevel.Info, query.Name, "Stored Access query SQL.");
                 }
@@ -282,6 +308,23 @@ public sealed class ExportService
         return new ExportResult { Written = written, Skipped = skipped, Failed = failed };
     }
 
-    private static void Log(IProgress<ExportLogEntry>? progress, LogLevel level, string name, string message) =>
-        progress?.Report(new ExportLogEntry(level, name, message));
+    private static int EstimateRow(IReadOnlyDictionary<string, object?> row)
+    {
+        var bytes = 0;
+        foreach (var value in row.Values)
+        {
+            bytes += value switch
+            {
+                string text => text.Length,
+                byte[] blob => blob.Length,
+                null => 1,
+                _ => 8
+            };
+        }
+
+        return bytes;
+    }
+
+    private static void Log(IProgress<ExportLogEntry>? progress, LogLevel level, string name, string message, bool transient = false) =>
+        progress?.Report(new ExportLogEntry(level, name, message) { Transient = transient });
 }

@@ -11,15 +11,16 @@ public sealed class AceMdbSession : IMdbSession
 {
     private readonly OpenOptions _options;
     private readonly OleDbConnection _connection;
-    private readonly AccessComClient _com;
+    private AccessComClient? _com;
     private Catalog? _catalog;
 
     public AceMdbSession(OpenOptions options)
     {
         _options = options;
         _connection = AceConnectionFactory.Open(options);
-        _com = AccessComClient.TryStart(options);
     }
+
+    public string? AccessUnavailableReason => _com is { IsAvailable: false } ? _com.SkipReason : null;
 
     public Catalog ReadCatalog()
     {
@@ -37,8 +38,11 @@ public sealed class AceMdbSession : IMdbSession
             throw new InvalidOperationException("Linked tables are not read so the export stays offline.");
         }
 
-        using var command = new OleDbCommand("SELECT * FROM " + JetSql.Bracket(tableName), _connection);
-        using var reader = command.ExecuteReader();
+        using var command = new OleDbCommand("SELECT * FROM " + JetSql.Bracket(tableName), _connection)
+        {
+            CommandTimeout = 0
+        };
+        using var reader = command.ExecuteReader(CommandBehavior.SequentialAccess | CommandBehavior.SingleResult);
         var names = Enumerable.Range(0, reader.FieldCount).Select(reader.GetName).ToArray();
         while (reader.Read())
         {
@@ -52,13 +56,26 @@ public sealed class AceMdbSession : IMdbSession
         }
     }
 
-    public UiDumpResult TryDumpUiObject(AccessObjectKind kind, string name) => _com.SaveAsText(kind, name);
+    public IReadOnlyDictionary<string, string?> ReadQuerySql()
+    {
+        var map = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var query in Com.ReadQueries())
+        {
+            map[query.Name] = query.Sql;
+        }
+
+        return map;
+    }
+
+    public UiDumpResult TryDumpUiObject(AccessObjectKind kind, string name) => Com.SaveAsText(kind, name);
 
     public void Dispose()
     {
-        _com.Dispose();
+        _com?.Dispose();
         _connection.Dispose();
     }
+
+    private AccessComClient Com => _com ??= AccessComClient.TryStart(_options);
 
     private Catalog BuildCatalog()
     {
@@ -74,14 +91,18 @@ public sealed class AceMdbSession : IMdbSession
             Tables = tables,
             Queries = queries,
             ForeignKeys = foreignKeys,
-            UiObjects = uiObjects,
-            AccessComStatus = _com.IsAvailable ? "available" : _com.SkipReason
+            UiObjects = uiObjects
         };
     }
 
     private IReadOnlyList<TableSchema> ReadTables(IReadOnlyDictionary<string, MsysRow> msys)
     {
+        var identityByTable = ReadIdentityColumns();
         using var schema = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Tables, null);
+        using var columnSchema = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Columns, null);
+        using var indexSchema = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Indexes, null);
+        var columnsByTable = GroupByTable(columnSchema, "TABLE_NAME");
+        var indexesByTable = GroupByTable(indexSchema, "TABLE_NAME");
         var tables = new List<TableSchema>();
         if (schema is null)
         {
@@ -109,8 +130,10 @@ public sealed class AceMdbSession : IMdbSession
                 || name.StartsWith("MSys", StringComparison.OrdinalIgnoreCase)
                 || (msysRow is not null && msysRow.Type == 1 && (msysRow.Flags & 0x80000000) != 0 && name.StartsWith("MSys", StringComparison.OrdinalIgnoreCase));
 
-            var columns = ReadColumns(name, isLinked);
-            var indexes = ReadIndexes(name);
+            columnsByTable.TryGetValue(name, out var columnRows);
+            indexesByTable.TryGetValue(name, out var indexRows);
+            var columns = ReadColumns(name, isLinked, columnRows, columnSchema, identityByTable);
+            var indexes = ReadIndexes(indexRows);
             var pk = indexes.FirstOrDefault(i => i.IsPrimaryKey)?.Columns ?? [];
 
             tables.Add(new TableSchema
@@ -128,17 +151,21 @@ public sealed class AceMdbSession : IMdbSession
         return tables;
     }
 
-    private IReadOnlyList<ColumnSchema> ReadColumns(string tableName, bool isLinked)
+    private IReadOnlyList<ColumnSchema> ReadColumns(
+        string tableName,
+        bool isLinked,
+        List<DataRow>? rows,
+        DataTable? schema,
+        IReadOnlyDictionary<string, HashSet<string>> identityByTable)
     {
-        using var schema = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Columns, [null, null, tableName]);
-        var autoIncrement = isLinked ? new HashSet<string>() : ReadAutoIncrementColumns(tableName);
+        identityByTable.TryGetValue(tableName, out var autoIncrement);
         var columns = new List<ColumnSchema>();
-        if (schema is null)
+        if (rows is null || rows.Count == 0 || schema is null)
         {
             return columns;
         }
 
-        var ordered = schema.Rows.Cast<DataRow>()
+        var ordered = rows
             .OrderBy(r => Convert.ToInt32(r["ORDINAL_POSITION"], CultureInfo.InvariantCulture))
             .ToList();
 
@@ -160,7 +187,7 @@ public sealed class AceMdbSession : IMdbSession
             int? scale = schema.Columns.Contains("NUMERIC_SCALE") && row["NUMERIC_SCALE"] is not DBNull
                 ? Convert.ToInt32(row["NUMERIC_SCALE"], CultureInfo.InvariantCulture)
                 : null;
-            var identity = autoIncrement.Contains(name);
+            var identity = !isLinked && autoIncrement is not null && autoIncrement.Contains(name);
             var mapped = AccessTypeMapper.Map(oleDbType, typeName, identity);
 
             columns.Add(new ColumnSchema
@@ -180,49 +207,52 @@ public sealed class AceMdbSession : IMdbSession
         return columns;
     }
 
-    private HashSet<string> ReadAutoIncrementColumns(string tableName)
+    private IReadOnlyDictionary<string, HashSet<string>> ReadIdentityColumns()
     {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        try
-        {
-            using var command = new OleDbCommand("SELECT * FROM " + JetSql.Bracket(tableName) + " WHERE 1=0", _connection);
-            using var reader = command.ExecuteReader(CommandBehavior.SchemaOnly);
-            var schema = reader.GetSchemaTable();
-            if (schema is null)
-            {
-                return names;
-            }
-
-            foreach (DataRow row in schema.Rows)
-            {
-                if (row["IsAutoIncrement"] is true)
-                {
-                    var name = Convert.ToString(row["ColumnName"], CultureInfo.InvariantCulture);
-                    if (!string.IsNullOrWhiteSpace(name))
-                    {
-                        names.Add(name);
-                    }
-                }
-            }
-        }
-        catch (Exception)
-        {
-            // System tables may refuse even a schema-only select.
-        }
-
-        return names;
+        // DAO field attributes only. SELECT * + GetSchemaTable makes ACE scan every Memo/OLE page
+        // to fill ColumnSize, which reads the whole file once per table.
+        return IdentityColumns.TryRead(_options)
+            ?? Com.ReadAutoIncrementColumns()
+            ?? new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
     }
 
-    private IReadOnlyList<IndexSchema> ReadIndexes(string tableName)
+    private static Dictionary<string, List<DataRow>> GroupByTable(DataTable? schema, string column)
     {
-        using var schema = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Indexes, [null, null, null, null, tableName]);
-        if (schema is null)
+        var map = new Dictionary<string, List<DataRow>>(StringComparer.OrdinalIgnoreCase);
+        if (schema is null || !schema.Columns.Contains(column))
+        {
+            return map;
+        }
+
+        foreach (DataRow row in schema.Rows)
+        {
+            var name = Convert.ToString(row[column], CultureInfo.InvariantCulture);
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            if (!map.TryGetValue(name, out var list))
+            {
+                list = [];
+                map[name] = list;
+            }
+
+            list.Add(row);
+        }
+
+        return map;
+    }
+
+    private static IReadOnlyList<IndexSchema> ReadIndexes(List<DataRow>? tableRows)
+    {
+        if (tableRows is null || tableRows.Count == 0)
         {
             return [];
         }
 
         var groups = new Dictionary<string, List<DataRow>>(StringComparer.OrdinalIgnoreCase);
-        foreach (DataRow row in schema.Rows)
+        foreach (var row in tableRows)
         {
             var indexName = Convert.ToString(row["INDEX_NAME"], CultureInfo.InvariantCulture);
             if (string.IsNullOrWhiteSpace(indexName))
@@ -240,16 +270,16 @@ public sealed class AceMdbSession : IMdbSession
         }
 
         var indexes = new List<IndexSchema>();
-        foreach (var (name, rows) in groups)
+        foreach (var (name, group) in groups)
         {
-            var ordered = rows
+            var ordered = group
                 .OrderBy(r => Convert.ToInt32(r["ORDINAL_POSITION"], CultureInfo.InvariantCulture))
                 .Select(r => Convert.ToString(r["COLUMN_NAME"], CultureInfo.InvariantCulture))
                 .Where(c => !string.IsNullOrWhiteSpace(c))
                 .Cast<string>()
                 .ToList();
 
-            var first = rows[0];
+            var first = group[0];
             indexes.Add(new IndexSchema
             {
                 Name = name,
@@ -311,11 +341,6 @@ public sealed class AceMdbSession : IMdbSession
     private IReadOnlyList<QuerySchema> ReadQueries(IReadOnlyDictionary<string, MsysRow> msys)
     {
         var byName = new Dictionary<string, QuerySchema>(StringComparer.OrdinalIgnoreCase);
-        foreach (var query in _com.ReadQueries())
-        {
-            byName[query.Name] = query;
-        }
-
         try
         {
             using var views = _connection.GetOleDbSchemaTable(OleDbSchemaGuid.Views, null);
@@ -354,8 +379,8 @@ public sealed class AceMdbSession : IMdbSession
 
     private IReadOnlyList<UiObjectInfo> ReadUiObjects(IReadOnlyDictionary<string, MsysRow> msys)
     {
-        var list = _com.ListUiObjects().ToList();
-        var seen = new HashSet<string>(list.Select(o => o.Kind + ":" + o.Name), StringComparer.OrdinalIgnoreCase);
+        var list = new List<UiObjectInfo>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var row in msys.Values)
         {

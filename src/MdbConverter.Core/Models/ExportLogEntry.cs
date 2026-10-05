@@ -7,4 +7,7 @@ public enum LogLevel
     Error
 }
 
-public sealed record ExportLogEntry(LogLevel Level, string ObjectName, string Message);
+public sealed record ExportLogEntry(LogLevel Level, string ObjectName, string Message)
+{
+    public bool Transient { get; init; }
+}

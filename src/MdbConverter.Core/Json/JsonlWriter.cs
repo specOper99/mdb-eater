@@ -9,7 +9,7 @@ public static class JsonlWriter
     public static readonly JsonWriterOptions WriterOptions = new()
     {
         Indented = false,
-        SkipValidation = false
+        SkipValidation = true
     };
 
     public static void WriteRow(Utf8JsonWriter writer, IReadOnlyList<ColumnSchema> columns, IReadOnlyDictionary<string, object?> values)

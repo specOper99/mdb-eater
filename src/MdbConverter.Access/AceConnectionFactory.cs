@@ -43,6 +43,8 @@ internal static class AceConnectionFactory
         };
         builder["Persist Security Info"] = false;
         builder["Mode"] = "Share Deny None";
+        // Kilobytes. Jet tops out at 4096; a larger cache keeps a big sequential read off the disk.
+        builder["Jet OLEDB:Max Buffer Size"] = 4096;
 
         if (!string.IsNullOrEmpty(options.DatabasePassword))
         {

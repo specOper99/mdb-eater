@@ -6,7 +6,7 @@ namespace MdbConverter.Core.Postgres;
 
 public sealed class PostgresSqlWriter : IDisposable
 {
-    public const int DefaultBatchSize = 50;
+    public const int DefaultBatchSize = 200;
     private const string CreatedTable = "_mdb_created";
 
     private readonly TextWriter _writer;
@@ -145,7 +145,7 @@ public sealed class PostgresSqlWriter : IDisposable
         };
 
         WriteTableDefinition(table);
-        const int chunk = 50;
+        var chunk = _batchSize;
         for (var i = 0; i < queries.Count; i += chunk)
         {
             var slice = queries.Skip(i).Take(chunk)

@@ -6,5 +6,7 @@ public interface IMdbSession : IDisposable
 {
     Catalog ReadCatalog();
     IEnumerable<IReadOnlyDictionary<string, object?>> ReadRows(string tableName);
+    IReadOnlyDictionary<string, string?> ReadQuerySql();
+    string? AccessUnavailableReason { get; }
     UiDumpResult TryDumpUiObject(AccessObjectKind kind, string name);
 }

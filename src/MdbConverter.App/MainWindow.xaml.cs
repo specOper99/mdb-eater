@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using System.ComponentModel;
 using System.Text;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
@@ -23,6 +24,8 @@ public sealed partial class MainWindow : Window
     private Catalog? _catalog;
     private int _step;
     private bool _busy;
+    private bool _suppressSelectionEvents;
+    private CancellationTokenSource? _exportCts;
 
     public MainWindow()
     {
@@ -114,29 +117,32 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    private void SelectAll_Click(object sender, RoutedEventArgs e)
+    private void SelectAll_Click(object sender, RoutedEventArgs e) => SetAllSelected(true);
+
+    private void SelectNone_Click(object sender, RoutedEventArgs e) => SetAllSelected(false);
+
+    private void SetAllSelected(bool selected)
     {
+        _suppressSelectionEvents = true;
         foreach (var item in _objects)
         {
-            item.IsSelected = true;
+            item.IsSelected = selected;
         }
 
-        RefreshObjectList();
-    }
-
-    private void SelectNone_Click(object sender, RoutedEventArgs e)
-    {
-        foreach (var item in _objects)
-        {
-            item.IsSelected = false;
-        }
-
-        RefreshObjectList();
+        _suppressSelectionEvents = false;
+        UpdateObjectCount();
     }
 
     private async void Export_Click(object sender, RoutedEventArgs e)
     {
-        if (_busy || _session is null || _catalog is null)
+        if (_busy)
+        {
+            _exportCts?.Cancel();
+            ExportStatus.Text = "Canceling…";
+            return;
+        }
+
+        if (_session is null || _catalog is null)
         {
             return;
         }
@@ -181,6 +187,8 @@ public sealed partial class MainWindow : Window
         };
 
         _busy = true;
+        _exportCts = new CancellationTokenSource();
+        ExportButton.Content = "Cancel";
         ExportProgress.Visibility = Visibility.Visible;
         ExportStatus.Text = "Exporting…";
         _log.Clear();
@@ -189,15 +197,27 @@ public sealed partial class MainWindow : Window
 
         var progress = new Progress<ExportLogEntry>(entry =>
         {
+            if (entry.Transient)
+            {
+                ExportStatus.Text = entry.ObjectName + ": " + entry.Message;
+                return;
+            }
+
             _log.Append('[').Append(entry.Level).Append("] ").Append(entry.ObjectName).Append(": ").AppendLine(entry.Message);
             LogBlock.Text = _log.ToString();
+            ExportStatus.Text = entry.ObjectName + ": " + entry.Message;
         });
 
         try
         {
             var session = _session;
-            var result = await _sta.RunAsync(() => new ExportService().Run(request, session, progress));
+            var token = _exportCts.Token;
+            var result = await _sta.RunAsync(() => new ExportService().Run(request, session, progress, token));
             ExportStatus.Text = $"Done. Written {result.Written}, skipped {result.Skipped}, failed {result.Failed}.";
+        }
+        catch (OperationCanceledException)
+        {
+            ExportStatus.Text = "Canceled. Output folder may be incomplete.";
         }
         catch (Exception ex)
         {
@@ -206,7 +226,10 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            _exportCts?.Dispose();
+            _exportCts = null;
             _busy = false;
+            ExportButton.Content = "Export";
             ExportProgress.Visibility = Visibility.Collapsed;
             SetButtons();
         }
@@ -230,6 +253,8 @@ public sealed partial class MainWindow : Window
         SourceError.Text = string.Empty;
         _busy = true;
         NextButton.Content = "Scanning…";
+        ScanProgress.Visibility = Visibility.Visible;
+        ScanStatus.Text = "Opening the database and reading schema. Rows stay on disk until export.";
         SetButtons();
 
         CloseSession();
@@ -268,6 +293,8 @@ public sealed partial class MainWindow : Window
         finally
         {
             _busy = false;
+            ScanProgress.Visibility = Visibility.Collapsed;
+            ScanStatus.Text = string.Empty;
             NextButton.Content = _step == 0 ? "Scan" : "Next";
             SetButtons();
         }
@@ -289,20 +316,50 @@ public sealed partial class MainWindow : Window
                 badges.Add("linked");
             }
 
-            _objects.Add(new SelectableObject(AccessObjectKind.Table, table.Name, string.Join(", ", badges), table.LinkedSource, selected: true));
+            var item = new SelectableObject(AccessObjectKind.Table, table.Name, string.Join(", ", badges), table.LinkedSource, selected: !table.IsSystem);
+            item.PropertyChanged += OnObjectChanged;
+            _objects.Add(item);
         }
 
         foreach (var query in catalog.Queries.OrderBy(q => q.Name, StringComparer.OrdinalIgnoreCase))
         {
-            _objects.Add(new SelectableObject(AccessObjectKind.Query, query.Name, string.Empty, query.Sql, selected: true));
+            var item = new SelectableObject(AccessObjectKind.Query, query.Name, string.Empty, query.Sql, selected: true);
+            item.PropertyChanged += OnObjectChanged;
+            _objects.Add(item);
         }
 
         foreach (var ui in catalog.UiObjects.OrderBy(o => o.Kind).ThenBy(o => o.Name, StringComparer.OrdinalIgnoreCase))
         {
-            _objects.Add(new SelectableObject(ui.Kind, ui.Name, string.Empty, null, selected: true));
+            var item = new SelectableObject(ui.Kind, ui.Name, string.Empty, null, selected: true);
+            item.PropertyChanged += OnObjectChanged;
+            _objects.Add(item);
         }
 
-        ObjectCountLabel.Text = _objects.Count + " objects";
+        UpdateObjectCount();
+    }
+
+    private void OnObjectChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (_suppressSelectionEvents || e.PropertyName != nameof(SelectableObject.IsSelected))
+        {
+            return;
+        }
+
+        UpdateObjectCount();
+    }
+
+    private void UpdateObjectCount()
+    {
+        var selected = 0;
+        foreach (var item in _objects)
+        {
+            if (item.IsSelected)
+            {
+                selected++;
+            }
+        }
+
+        ObjectCountLabel.Text = selected + " of " + _objects.Count + " selected";
     }
 
     private void ShowStep(int step)
@@ -327,17 +384,7 @@ public sealed partial class MainWindow : Window
     {
         BackButton.IsEnabled = !_busy && _step > 0;
         NextButton.IsEnabled = !_busy;
-        ExportButton.IsEnabled = !_busy;
-    }
-
-    private void RefreshObjectList()
-    {
-        var snapshot = _objects.ToList();
-        _objects.Clear();
-        foreach (var item in snapshot)
-        {
-            _objects.Add(item);
-        }
+        ExportButton.IsEnabled = !_busy || _exportCts is not null;
     }
 
     private void PersistSource(string mdbPath)

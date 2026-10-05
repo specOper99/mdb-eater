@@ -10,7 +10,7 @@ public static class Program
     public static void Main(string[] args)
     {
         ComWrappersSupport.InitializeComWrappers();
-        Application.Start(_ =>
+        Application.Start(args =>
         {
             var context = new DispatcherQueueSynchronizationContext(DispatcherQueue.GetForCurrentThread());
             SynchronizationContext.SetSynchronizationContext(context);

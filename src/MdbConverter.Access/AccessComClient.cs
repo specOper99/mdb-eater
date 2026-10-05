@@ -32,6 +32,15 @@ internal sealed class AccessComClient : IDisposable
             client._app = Activator.CreateInstance(type)
                 ?? throw new InvalidOperationException("Access.Application could not be created.");
             Set(client._app, "Visible", false);
+            try
+            {
+                // msoAutomationSecurityForceDisable. Stops AutoExec from scanning or rewriting on open.
+                Set(client._app, "AutomationSecurity", 3);
+            }
+            catch (Exception)
+            {
+                // Older Access builds may not expose AutomationSecurity.
+            }
 
             if (!string.IsNullOrWhiteSpace(options.WorkgroupPath))
             {
@@ -66,6 +75,29 @@ internal sealed class AccessComClient : IDisposable
         }
 
         return client;
+    }
+
+    public IReadOnlyDictionary<string, HashSet<string>>? ReadAutoIncrementColumns()
+    {
+        if (_app is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            var db = Invoke(_app, "CurrentDb");
+            if (db is null)
+            {
+                return null;
+            }
+
+            return IdentityColumns.FromDatabase(db);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
     }
 
     public IReadOnlyList<QuerySchema> ReadQueries()

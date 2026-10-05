@@ -50,6 +50,8 @@
                             <PasswordBox x:Name="WorkgroupPasswordBox" Header="Password"/>
                         </StackPanel>
                     </Expander>
+                    <ProgressBar x:Name="ScanProgress" IsIndeterminate="True" Visibility="Collapsed"/>
+                    <TextBlock x:Name="ScanStatus" TextWrapping="Wrap" Opacity="0.8"/>
                     <TextBlock x:Name="SourceError" Foreground="Red" TextWrapping="Wrap"/>
                 </StackPanel>
             </ScrollViewer>

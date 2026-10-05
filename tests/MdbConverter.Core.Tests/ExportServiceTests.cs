@@ -145,13 +145,64 @@ public class ExportServiceTests
         }
     }
 
+    [Fact]
+    public void Missing_query_sql_is_filled_from_the_session()
+    {
+        var catalog = new Catalog
+        {
+            SourcePath = "x.mdb",
+            Tables = [],
+            Queries = [new QuerySchema { Name = "Q1", Sql = null }],
+            ForeignKeys = [],
+            UiObjects = []
+        };
+        var session = new FakeSession { Catalog = catalog };
+        session.QuerySql["Q1"] = "SELECT 1";
+        var output = Path.Combine(Path.GetTempPath(), "mdb-converter-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(output);
+        try
+        {
+            var result = new ExportService().Run(
+                new ExportRequest
+                {
+                    Catalog = catalog,
+                    Selection = new ObjectSelection
+                    {
+                        TableNames = new HashSet<string>(),
+                        QueryNames = new HashSet<string> { "Q1" },
+                        UiObjects = new HashSet<UiObjectKey>()
+                    },
+                    OutputDirectory = output,
+                    WriteJson = false,
+                    WritePostgresSql = true,
+                    ConflictMode = ConflictMode.Replace
+                },
+                session);
+
+            Assert.Equal(1, result.Written);
+            Assert.Equal(0, result.Failed);
+            var sql = File.ReadAllText(Path.Combine(output, "postgres.sql"));
+            Assert.Contains("SELECT 1", sql, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(output, true);
+        }
+    }
+
     private sealed class FakeSession : IMdbSession
     {
         public required Catalog Catalog { get; init; }
         public Dictionary<string, List<Dictionary<string, object?>>> Rows { get; } = new(StringComparer.Ordinal);
         public List<string> RowReads { get; } = [];
 
+        public Dictionary<string, string?> QuerySql { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+        public string? AccessUnavailableReason => QuerySql.Count == 0 ? "Microsoft Access is not installed." : null;
+
         public Catalog ReadCatalog() => Catalog;
+
+        public IReadOnlyDictionary<string, string?> ReadQuerySql() => QuerySql;
 
         public IEnumerable<IReadOnlyDictionary<string, object?>> ReadRows(string tableName)
         {
