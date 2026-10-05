@@ -38,15 +38,11 @@ internal static class AceConnectionFactory
     {
         var builder = new OleDbConnectionStringBuilder
         {
-            Provider = provider,
-            DataSource = options.MdbPath
+            Provider = provider
         };
+        builder["Data Source"] = options.MdbPath;
         builder["Persist Security Info"] = false;
-        // ConnectModeEnum.adModeShareDenyNone. The English name is not a legal
-        // value: Jet splits on the spaces and looks up an ISAM named "Deny".
         builder["Mode"] = 16;
-        // Kilobytes. Jet tops out at 4096; a larger cache keeps a big sequential read off the disk.
-        builder["Jet OLEDB:Max Buffer Size"] = 4096;
 
         if (!string.IsNullOrEmpty(options.DatabasePassword))
         {
